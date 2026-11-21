@@ -1,0 +1,61 @@
+name: NBA Meccsradar
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"     # félóránként
+  workflow_dispatch:            # kézi indítás: Actions → NBA Meccsradar → Run workflow
+  push:
+    branches: [main]
+    paths: ["nba_meccsradar.py", ".github/workflows/**"]
+
+permissions:
+  contents: write    # a data/ mappa visszaírása a repóba
+  pages: write
+  id-token: write
+
+concurrency:
+  group: meccsradar
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Függőségek
+        run: pip install -r requirements.txt
+
+      - name: Elemzés és statikus oldal
+        run: python nba_meccsradar.py --build site --data data
+
+      - name: Előzmények visszaírása
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "Nincs változás a data/ mappában."
+          else
+            git commit -m "Adatfrissítés $(date -u +'%Y-%m-%d %H:%M') UTC"
+            git pull --rebase --autostash || true
+            git push
+          fi
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
