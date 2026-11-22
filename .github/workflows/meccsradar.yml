@@ -23,11 +23,11 @@ jobs:
     timeout-minutes: 25
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: https://zoltanfarkasnemeth.github.io/NBA/
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -53,9 +53,18 @@ jobs:
 
       - uses: actions/configure-pages@v5
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: site
 
       - id: deploy
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+
+      - name: Várakozás újrapróbálás előtt
+        if: steps.deploy.outcome == 'failure'
+        run: sleep 30
+
+      - name: Deploy (2. próba)
+        if: steps.deploy.outcome == 'failure'
         uses: actions/deploy-pages@v4
