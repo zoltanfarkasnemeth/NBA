@@ -35,21 +35,45 @@ jobs:
       - name: Függőségek
         run: pip install -r requirements.txt
 
+      # Újrafuttatáskor (Re-run) a GitHub a régi commitot tölti le. Ezért a data/ mappát
+      # mindig a main ág legfrissebb állapotából vesszük, különben régi adatokkal számolna.
+      - name: Legfrissebb adatok a main ágról
+        run: |
+          git fetch --depth=1 origin main
+          git checkout FETCH_HEAD -- data 2>/dev/null || echo "Még nincs data/ mappa a repóban."
+
       - name: Elemzés és statikus oldal
         run: python nba_meccsradar.py --build site --data data
 
-      - name: Előzmények visszaírása
+      # Akkor is lefut, ha az elemzés közben hiba volt: ami addig az adatbázisba került, az megmarad.
+      # Ha közben más futás már írt a repóba, a két adatbázist összefésüli, nem írja felül.
+      - name: Adatbázis és előzmények visszaírása
+        if: always()
         run: |
+          [ -f data/meccsradar.db ] || { echo "Nincs adatbázis, nincs mit menteni."; exit 0; }
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git add data
-          if git diff --cached --quiet; then
-            echo "Nincs változás a data/ mappában."
-          else
-            git commit -m "Adatfrissítés $(date -u +'%Y-%m-%d %H:%M') UTC"
-            git pull --rebase --autostash || true
-            git push
-          fi
+          for i in 1 2 3 4 5; do
+            git fetch --depth=1 origin main
+            if git cat-file -e FETCH_HEAD:data/meccsradar.db 2>/dev/null; then
+              git show FETCH_HEAD:data/meccsradar.db > "$RUNNER_TEMP/remote.db"
+              python nba_meccsradar.py --data data --merge-db "$RUNNER_TEMP/remote.db"
+            fi
+            git reset -q FETCH_HEAD          # a main legfrissebb állapotára épül, csak a data/ változik
+            git add data
+            if git diff --cached --quiet; then
+              echo "Nincs változás a data/ mappában."
+              exit 0
+            fi
+            git commit -q -m "Adatfrissítés $(date -u +'%Y-%m-%d %H:%M') UTC"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "A push nem sikerült ($i. próba), újra..."
+            sleep $((i * 5))
+          done
+          echo "::error::Az adatbázist 5 próbálkozás után sem sikerült visszaírni."
+          exit 1
 
       - uses: actions/configure-pages@v5
 
