@@ -41,6 +41,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 import traceback
@@ -89,7 +90,8 @@ CONFIG = {
     "market_weight": 0.6,          # a végső becslésben a fogadóirodák súlya (0–1)
     "news_max_pts": 1.0,           # a hírhangulat legfeljebb ennyi pontot mozdít
     "value_edge": 0.04,            # ennyi várható érték felett jelöljük "értékesnek" a szorzót
-    "pred_file": "nba_predikciok.json",
+    "pred_file": "nba_predikciok.json",   # régi JSON-tár: az első indításkor átkerül az adatbázisba
+    "db_file": "meccsradar.db",           # SQLite: becslések, eredmények, becslés-előzmények
 }
 
 TZ = ZoneInfo("Europe/Budapest")
@@ -1223,6 +1225,129 @@ class DemoSource:
 
 
 # ---------------------------------------------------------------------------
+# Becslések tárolása (SQLite)
+# ---------------------------------------------------------------------------
+class PredStore:
+    """A becslések, a végeredmények és a becslések változásának naplója egy SQLite-fájlban.
+
+    predictions: meccsenként a legutolsó kezdés előtti becslés (minden modell, JSON-ban)
+    results:     a lejátszott meccsek végeredménye
+    history:     a végső becslés minden érdemi változása (mikor mit mondott a modell)
+
+    Minden számolás végén commitol, így ami egyszer kiszámolódott, az egy későbbi hiba
+    vagy újrafuttatás miatt nem vész el. Két adatbázis összefésülhető (merge), ezt
+    a GitHub Actions használja, ha közben a repóba újabb adat került.
+    """
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS predictions(
+        game_id TEXT PRIMARY KEY, ts REAL, home TEXT, away TEXT, stype INTEGER,
+        models TEXT NOT NULL, updated REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS results(
+        game_id TEXT PRIMARY KEY, hs REAL NOT NULL, as_ REAL NOT NULL, saved REAL);
+    CREATE TABLE IF NOT EXISTS history(
+        game_id TEXT NOT NULL, at REAL NOT NULL, margin REAL, total REAL, p REAL, hp REAL, ap REAL,
+        PRIMARY KEY(game_id, at));
+    """
+    HIST_MIN = {"margin": 0.5, "total": 1.0, "p": 0.01}   # ennél kisebb változás nem kerül a naplóba
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(str(self.path), check_same_thread=False)
+        self.db.executescript(self.SCHEMA)
+        self.db.commit()
+        self._last_hist = {gid: (m, t, p) for gid, m, t, p in self.db.execute(
+            "SELECT h.game_id, h.margin, h.total, h.p FROM history h JOIN "
+            "(SELECT game_id, MAX(at) at FROM history GROUP BY game_id) x USING(game_id, at)")}
+
+    def is_empty(self):
+        return self.db.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 0
+
+    def load(self):
+        """A régi JSON-tárral azonos alakú szótár: {meccs_id: {ts, home, away, stype, models, actual?}}."""
+        out = {}
+        with self.lock:
+            for gid, ts, h, a, st, models in self.db.execute(
+                    "SELECT game_id, ts, home, away, stype, models FROM predictions"):
+                out[gid] = {"ts": ts, "home": h, "away": a, "stype": st, "models": json.loads(models)}
+            for gid, hs, as_ in self.db.execute("SELECT game_id, hs, as_ FROM results"):
+                if gid in out:
+                    out[gid]["actual"] = {"hs": hs, "as": as_}
+        return out
+
+    def save_pred(self, gid, rec):
+        now = time.time()
+        f = rec["models"].get("final") or {}
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO predictions(game_id, ts, home, away, stype, models, updated) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(game_id) DO UPDATE SET ts=excluded.ts, home=excluded.home, away=excluded.away, "
+                "stype=excluded.stype, models=excluded.models, updated=excluded.updated",
+                (gid, rec["ts"], rec["home"], rec["away"], rec["stype"],
+                 json.dumps(clean(rec["models"]), ensure_ascii=False), now))
+            if f:
+                last = self._last_hist.get(gid)
+                cur = (f.get("margin"), f.get("total"), f.get("p"))
+                if last is None or any(c is not None and (l is None or abs(c - l) >= self.HIST_MIN[k])
+                                       for k, c, l in zip(("margin", "total", "p"), cur, last)):
+                    self.db.execute("INSERT OR IGNORE INTO history VALUES(?,?,?,?,?,?,?)",
+                                    (gid, now, *cur, f.get("hp"), f.get("ap")))
+                    self._last_hist[gid] = cur
+
+    def save_result(self, gid, hs, as_):
+        with self.lock:
+            self.db.execute("INSERT OR IGNORE INTO results VALUES(?,?,?,?)", (gid, hs, as_, time.time()))
+
+    def commit(self):
+        with self.lock:
+            self.db.commit()
+
+    def import_json(self, path):
+        """Egyszeri átállás a régi nba_predikciok.json-ról."""
+        try:
+            old = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        n = 0
+        for gid, rec in old.items():
+            if not isinstance(rec, dict) or "models" not in rec:
+                continue
+            with self.lock:
+                self.db.execute("INSERT OR IGNORE INTO predictions VALUES(?,?,?,?,?,?,?)",
+                                (gid, rec.get("ts"), rec.get("home"), rec.get("away"), rec.get("stype"),
+                                 json.dumps(rec["models"], ensure_ascii=False), rec.get("ts") or 0))
+            act = rec.get("actual")
+            if act and act.get("hs") is not None:
+                self.save_result(gid, act["hs"], act["as"])
+            n += 1
+        self.commit()
+        return n
+
+    def merge(self, other):
+        """Egy másik adatbázis (pl. a repó legfrissebb állapota) beolvasztása.
+        Becslésnél az újabb nyer, eredmény és napló esetén minden sor megmarad."""
+        with self.lock:
+            self.db.execute("ATTACH DATABASE ? AS o", (str(other),))
+            try:
+                self.db.execute(
+                    "INSERT INTO predictions SELECT * FROM o.predictions WHERE true "
+                    "ON CONFLICT(game_id) DO UPDATE SET ts=excluded.ts, home=excluded.home, away=excluded.away, "
+                    "stype=excluded.stype, models=excluded.models, updated=excluded.updated "
+                    "WHERE excluded.updated > predictions.updated")
+                self.db.execute("INSERT OR IGNORE INTO results SELECT * FROM o.results")
+                self.db.execute("INSERT OR IGNORE INTO history SELECT * FROM o.history")
+                self.db.commit()
+            finally:
+                self.db.execute("DETACH DATABASE o")
+
+    def close(self):
+        with self.lock:
+            self.db.commit()
+            self.db.close()
+
+
+# ---------------------------------------------------------------------------
 # Elemző motor
 # ---------------------------------------------------------------------------
 class Engine:
@@ -1247,11 +1372,11 @@ class Engine:
         self.status = {"phase": "Indulás…", "mode": src.name, "last_sched": None, "last_inj": None,
                        "last_news": None, "last_odds": None, "odds_left": None, "news_done": 0, "n": 30,
                        "players": 0, "errors": deque(maxlen=8)}
-        self.pred_path = Path(cfg["pred_file"])
-        try:
-            self.preds = json.loads(self.pred_path.read_text(encoding="utf-8"))
-        except Exception:
-            self.preds = {}
+        self.store = PredStore(cfg["db_file"])
+        if self.store.is_empty() and Path(cfg["pred_file"]).exists():
+            n = self.store.import_json(cfg["pred_file"])
+            print(f"  A régi {cfg['pred_file']} {n} becslése átkerült az adatbázisba ({cfg['db_file']}).", flush=True)
+        self.preds = self.store.load()
         self.state = {"status": self.status}
 
     def err(self, msg):
@@ -1811,6 +1936,7 @@ class Engine:
                                   for k, m in pr["models"].items()}}
                 if saved != rec:
                     self.preds[g["id"]] = rec
+                    self.store.save_pred(g["id"], rec)
                     dirty = True
             hit = None
             if g["state"] == "post" and saved and g["hs"] is not None:
@@ -1853,8 +1979,9 @@ class Engine:
                             value.append({"gid": g["id"], "match": match, "time": item["time"], "book": b["book"],
                                           "market": mkt, "pick": pick, "price": price, "p": pp, "ev": ev, "mev": mev,
                                           "pre": item["pre"]})
-            if g["state"] == "post" and saved and "actual" not in saved and g["hs"] is not None:
+            if g["state"] == "post" and g["completed"] and saved and "actual" not in saved and g["hs"] is not None:
                 saved["actual"] = {"hs": g["hs"], "as": g["as"]}
+                self.store.save_result(g["id"], g["hs"], g["as"])
                 dirty = True
         # befejezett, már kikerült meccsek eredményének rögzítése
         by_id = {g["id"]: g for g in games}
@@ -1862,15 +1989,13 @@ class Engine:
             g = by_id.get(gid)
             if g and g["completed"] and "actual" not in rec and g["hs"] is not None:
                 rec["actual"] = {"hs": g["hs"], "as": g["as"]}
+                self.store.save_result(gid, g["hs"], g["as"])
                 dirty = True
         if dirty:
-            if len(self.preds) > 3000:
-                for k in sorted(self.preds, key=lambda k: self.preds[k]["ts"])[:-3000]:
-                    del self.preds[k]
             try:
-                self.pred_path.write_text(json.dumps(clean(self.preds), ensure_ascii=False), encoding="utf-8")
+                self.store.commit()
             except Exception as e:
-                self.err(f"Predikciók mentése: {e}")
+                self.err(f"Becslések mentése az adatbázisba: {e}")
         value.sort(key=lambda v: -v["ev"])
 
         # csapattáblázat
@@ -2436,7 +2561,17 @@ def main():
     ap.add_argument("--days", type=int, help="hány napra előre (alapból 7)")
     ap.add_argument("--build", metavar="MAPPA", help="egyszer lefut, és statikus oldalt ír ebbe a mappába (GitHub Pages)")
     ap.add_argument("--data", metavar="MAPPA", default="data", help="--build módban az előzmények helye")
+    ap.add_argument("--merge-db", metavar="FÁJL",
+                    help="egy másik meccsradar.db beolvasztása a --data mappában lévőbe, majd kilép")
     args = ap.parse_args()
+
+    if args.merge_db:
+        st = PredStore(Path(args.data) / ("meccsradar_demo.db" if args.demo else "meccsradar.db"))
+        st.merge(args.merge_db)
+        n = st.db.execute("SELECT (SELECT COUNT(*) FROM predictions), (SELECT COUNT(*) FROM results)").fetchone()
+        st.close()
+        print(f"Összefésülve: {n[0]} becslés, {n[1]} eredmény.")
+        return
 
     cfg = dict(CONFIG)
     cfg["port"] = args.port
@@ -2446,6 +2581,7 @@ def main():
         cfg["days_ahead"] = args.days
     if args.demo:
         cfg["pred_file"] = "nba_predikciok_demo.json"
+        cfg["db_file"] = "meccsradar_demo.db"
         cfg["sched_refresh_s"] = 60
         cfg["news_refresh_s"] = 300
         cfg["odds_refresh_s"] = 600
@@ -2457,13 +2593,17 @@ def main():
 
     if args.build:
         cfg["pred_file"] = str(Path(args.data) / ("nba_predikciok_demo.json" if args.demo else "nba_predikciok.json"))
+        cfg["db_file"] = str(Path(args.data) / ("meccsradar_demo.db" if args.demo else "meccsradar.db"))
         Path(args.data).mkdir(parents=True, exist_ok=True)
         src.name += " · GitHub Actions"
         engine = Engine(src, cfg)
         engine.load_cache(args.data)
         print(f"NBA Meccsradar – egyszeri futás ({now_str()})", flush=True)
-        engine.run_once()
-        engine.save_cache(args.data)
+        try:
+            engine.run_once()
+        finally:
+            engine.store.close()      # ami addig kiszámolódott, az mindenképp lemezre kerül
+            engine.save_cache(args.data)
         write_static(engine, args.build)
         write_summary(engine)
         return
